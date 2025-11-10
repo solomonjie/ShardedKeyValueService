@@ -70,13 +70,25 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 		Value:   value,
 		Version: version,
 	}
-
+	isRetry := false
 	for {
 		reply := rpc.PutReply{}
 		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
 
 		if ok {
-			return reply.Err
+			if reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey {
+				return reply.Err
+			}
+
+			if reply.Err == rpc.ErrVersion {
+				if isRetry {
+					return rpc.ErrMaybe
+				} else {
+					return rpc.ErrVersion
+				}
+			}
+		} else {
+			isRetry = true
 		}
 
 		time.Sleep(10 * time.Millisecond)
