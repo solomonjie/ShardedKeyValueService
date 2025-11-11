@@ -50,12 +50,14 @@ type Raft struct {
 	Log         []LogEntry // 日志条目数组 (持久化，3A 仅需其长度和末尾 Term)
 	State       State      // 服务器当前状态 (非持久化)
 
-	// Leader 状态 (3A 仅需 NextIndex 和 MatchIndex 的初始化)
-	NextIndex  []int // 对于每个服务器，要发送给它的下一个日志条目的索引
-	MatchIndex []int // 对于每个服务器，已知已复制到它的最高日志条目的索引
+	CommitIndex int   // 已知已提交的最高日志条目的索引
+	LastApplied int   // 应用到状态机的最高日志条目的索引
+	NextIndex   []int // 对于每个服务器，要发送给它的下一个日志条目的索引
+	MatchIndex  []int // 对于每个服务器，已知已复制到它的最高日志条目的索引
 
 	// 计时器
-	ElectionTimer *time.Timer // 用于选举超时的计时器
+	ElectionTimer *time.Timer           // 用于选举超时的计时器
+	applyCh       chan raftapi.ApplyMsg // 接收者通道
 }
 
 // return currentTerm and whether this server
@@ -375,13 +377,27 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (3B).
+	if rf.State != Leader {
+		return -1, -1, false
+	}
 
-	return index, term, isLeader
+	newEntry := LogEntry{
+		Command: command,
+		Term:    rf.CurrentTerm,
+	}
+	rf.Log = append(rf.Log, newEntry)
+
+	newIndex := len(rf.Log) - 1
+
+	rf.MatchIndex[rf.me] = newIndex
+	rf.NextIndex[rf.me] = newIndex + 1
+
+	rf.sendHeartbeats()
+
+	return newIndex, rf.CurrentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -430,6 +446,35 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) applyDaemon() {
+	for !rf.killed() {
+		rf.mu.Lock()
+
+		if rf.CommitIndex > rf.LastApplied {
+			rf.LastApplied++
+			entry := rf.Log[rf.LastApplied]
+			rf.mu.Unlock()
+
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: rf.LastApplied,
+			}
+
+			rf.applyCh <- msg
+
+			rf.mu.Lock()
+		}
+
+		if rf.CommitIndex <= rf.LastApplied {
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		} else {
+			rf.mu.Unlock()
+		}
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -452,6 +497,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.Log = append(rf.Log, LogEntry{Term: 0})
 
 	rf.State = Follower
+	rf.CommitIndex = 0
+	rf.LastApplied = 0
+	rf.applyCh = applyCh
 
 	rf.NextIndex = make([]int, len(peers))
 	rf.MatchIndex = make([]int, len(peers))
@@ -464,6 +512,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applyDaemon()
 
 	return rf
 }
