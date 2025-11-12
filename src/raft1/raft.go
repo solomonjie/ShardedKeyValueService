@@ -188,35 +188,103 @@ func (rf *Raft) sendHeartbeats() {
 
 	for i := range rf.peers {
 		if i != rf.me {
-			go func(server int) {
-				rf.mu.Lock()
+			go rf.replicateLog(i)
+		}
+	}
+}
 
-				prevLogIndex := rf.NextIndex[server] - 1
-				prevLogTerm := rf.Log[prevLogIndex].Term
+func (rf *Raft) replicateLog(server int) {
+	rf.mu.Lock()
 
-				args := AppendEntriesArgs{
-					Term:         rf.CurrentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  prevLogTerm,
-					Entries:      []LogEntry{}, // 心跳
-					LeaderCommit: 0,            // 3A 中 CommitIndex 恒为 0
-				}
-				rf.mu.Unlock()
+	if rf.State != Leader {
+		rf.mu.Unlock()
+		return
+	}
 
-				reply := AppendEntriesReply{}
-				ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+	nextIndex := rf.NextIndex[server]
 
-				if ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
+	if nextIndex < 1 {
+		nextIndex = 1
+	}
 
-					if reply.Term > rf.CurrentTerm {
-						rf.becomeFollower(reply.Term)
-						return
-					}
-				}
-			}(i)
+	prevLogIndex := nextIndex - 1
+
+	if prevLogIndex > len(rf.Log)-1 {
+		rf.mu.Unlock()
+		return
+	}
+
+	prevLogTerm := rf.Log[prevLogIndex].Term
+	entries := rf.Log[nextIndex:]
+
+	args := AppendEntriesArgs{
+		Term:         rf.CurrentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.CommitIndex,
+	}
+	rf.mu.Unlock()
+
+	// 2. 发送 RPC
+	reply := AppendEntriesReply{}
+	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+
+	// 3. 处理回复
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		// 竞争条件检查：RPC 回复必须与发送时的任期一致，且自己仍是 Leader
+		if rf.State != Leader || args.Term != rf.CurrentTerm {
+			return
+		}
+
+		// 任期检查：如果 Follower 的任期更高，Leader 退位
+		if reply.Term > rf.CurrentTerm {
+			rf.becomeFollower(reply.Term)
+			return
+		}
+
+		// 成功处理 (Success=true)
+		if reply.Success {
+			// 更新 MatchIndex 和 NextIndex
+			newMatchIndex := args.PrevLogIndex + len(args.Entries)
+			if newMatchIndex > rf.MatchIndex[server] {
+				rf.MatchIndex[server] = newMatchIndex
+				rf.NextIndex[server] = newMatchIndex + 1
+			}
+
+			// 尝试更新 Leader 的 CommitIndex
+			rf.updateCommitIndex()
+
+		} else {
+			// 失败处理 (Success=false)，意味着日志不匹配
+			rf.NextIndex[server]--
+			// 立即再次尝试复制，以更快地收敛日志
+			go rf.replicateLog(server)
+		}
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	lastLogIndex := len(rf.Log) - 1
+
+	for recordIndex := rf.CommitIndex + 1; recordIndex <= lastLogIndex; recordIndex++ {
+		if rf.Log[recordIndex].Term != rf.CurrentTerm {
+			continue
+		}
+
+		count := 1
+		for i := range rf.peers {
+			if i != rf.me && rf.MatchIndex[i] >= recordIndex {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			rf.CommitIndex = recordIndex
 		}
 	}
 }
@@ -276,17 +344,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.Term > rf.CurrentTerm {
+	if args.Term > rf.CurrentTerm || rf.State == Candidate {
 		// becomeFollower 会更新任期并重置计时器
 		rf.becomeFollower(args.Term)
 	} else {
 		// 收到当前任期 Leader 的心跳（已是 Follower），只需重置计时器
 		rf.ElectionTimer.Reset(rf.getRandomElectionTimeout())
-
-		if rf.State == Candidate {
-			// 收到当前任期的 Leader 心跳，退位为 Follower
-			rf.State = Follower
-		}
 	}
 
 	reply.Term = rf.CurrentTerm
@@ -295,6 +358,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex > lastLogIndex || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
+	}
+
+	// 需要追加日志
+	var firstConflictIndex int = -1
+
+	// 1. 查找第一个冲突点 (或 Follower 日志末尾)
+	for i, entry := range args.Entries {
+		newEntryIndex := args.PrevLogIndex + 1 + i // 当前 Leader 条目的 Raft 索引
+
+		if newEntryIndex > lastLogIndex {
+			// Follower 日志太短，匹配到末尾。从 i 处开始，所有剩余条目都应该被追加。
+			firstConflictIndex = i
+			break
+		}
+
+		// 冲突检查: 此时 newEntryIndex <= lastLogIndex，访问 rf.Log[newEntryIndex] 是安全的
+		if rf.Log[newEntryIndex].Term != entry.Term {
+			// 冲突：删除冲突点及其之后的所有条目 (§5.3 规则 4)
+			rf.Log = rf.Log[:newEntryIndex] // **截断**
+
+			// 找到截断点，设置追加起点并跳出循环
+			firstConflictIndex = i
+			break
+		}
+		// else: 条目匹配，继续检查下一个条目
+	}
+
+	// 2. 批量追加剩余条目
+	if firstConflictIndex != -1 {
+		// 一次性追加 Leader 发来的所有剩余日志
+		rf.Log = append(rf.Log, args.Entries[firstConflictIndex:]...)
+		rf.persist() // 日志修改后必须持久化
+	}
+
+	// ... (4. 提交 Leader 的日志 - 保持不变)
+	if args.LeaderCommit > rf.CommitIndex {
+		newCommitIndex := args.LeaderCommit
+		if newCommitIndex > len(rf.Log)-1 {
+			newCommitIndex = len(rf.Log) - 1
+		}
+		if newCommitIndex > rf.CommitIndex {
+			rf.CommitIndex = newCommitIndex
+			// 触发 applyDaemon 提交日志
+		}
 	}
 
 	reply.Success = true
@@ -438,11 +545,6 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 		}
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
