@@ -139,19 +139,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if index < rf.LastIncludedIndex {
+	if index <= rf.LastIncludedIndex {
 		return
 	}
-
-	// 如果 index 超出当前日志范围，忽略
-	if index <= rf.LastIncludedIndex || index > rf.GetLastLogIndex() {
+	if index > rf.GetLastLogIndex() {
 		return
 	}
 
 	arrayIndex := rf.GetLogArrayIndex(index)
 	term := rf.Log[arrayIndex].Term
 
-	// 保留 index 之后的日志部分（如果有）
+	// 截断后缀（index 后面的日志保留）
 	var suffix []LogEntry
 	if arrayIndex+1 < len(rf.Log) {
 		suffix = make([]LogEntry, len(rf.Log[arrayIndex+1:]))
@@ -160,18 +158,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		suffix = make([]LogEntry, 0)
 	}
 
-	// 重要：在 truncation 之后，确保 rf.Log[0] 对应 LastIncludedIndex 的哨兵条目
+	// 新日志：哨兵 + suffix
 	newLog := make([]LogEntry, 0, 1+len(suffix))
 	newLog = append(newLog, LogEntry{Term: term})
 	newLog = append(newLog, suffix...)
 	rf.Log = newLog
 
-	// 更新快照元数据与持久化快照数据
-	rf.PersistedSnapshot = snapshot
 	rf.LastIncludedIndex = index
 	rf.LastIncludedTerm = term
+	rf.PersistedSnapshot = snapshot
 
-	// 同步 CommitIndex 与 LastApplied 到快照点（或更大者）
+	// ⬆️ 必须同步 commitIndex / lastApplied，否则会乱序 apply
 	if rf.CommitIndex < index {
 		rf.CommitIndex = index
 	}
@@ -179,7 +176,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.LastApplied = index
 	}
 
-	// 持久化 Raft 状态和快照（persist 会把 PersistedSnapshot 一并保存）
 	rf.persist()
 }
 
@@ -616,66 +612,66 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	reply.Term = rf.CurrentTerm
 
-	// 1. 任期检查
+	// 任期检查
 	if args.Term < rf.CurrentTerm {
+		rf.mu.Unlock()
+		return
+	}
+	if args.Term > rf.CurrentTerm {
+		rf.becomeFollower(args.Term)
+	}
+
+	// 重置选举计时器（避免立刻开始选举）
+	rf.ElectionTimer.Reset(rf.getRandomElectionTimeout())
+
+	// 如果 snapshot 旧于现有快照，丢弃
+	if args.LastIncludedIndex <= rf.LastIncludedIndex {
+		rf.mu.Unlock()
 		return
 	}
 
-	// 2. 更新任期并重置计时器
-	if args.Term > rf.CurrentTerm {
-		rf.becomeFollower(args.Term) // 包含更新任期和持久化
-	}
-
-	// 收到 Leader 消息，重置选举计时器
-	rf.ElectionTimer.Reset(rf.getRandomElectionTimeout())
-
-	// 3. 快照元数据检查：是否比当前快照旧
-	if args.LastIncludedIndex <= rf.LastIncludedIndex {
-		return // 快照已包含或更旧，忽略
-	}
-
-	// 4. 更新状态并处理日志：将 Leader 的快照信息应用到 Follower
-	// 保留快照点之后仍然存在且任期匹配的日志
-	newLog := make([]LogEntry, 0)
+	// 尝试保留 snapshot 之后仍然匹配的日志 suffix
+	var newLog []LogEntry
 	if args.LastIncludedIndex < rf.GetLastLogIndex() {
-		arrayIndex := rf.GetLogArrayIndex(args.LastIncludedIndex)
-		if arrayIndex >= 0 && arrayIndex < len(rf.Log) {
-			if rf.Log[arrayIndex].Term == args.LastIncludedTerm {
-				// 保留快照点之后的日志 (从 arrayIndex+1 处开始)
-				if arrayIndex+1 < len(rf.Log) {
-					newLog = append(newLog, rf.Log[arrayIndex+1:]...)
+		ai := rf.GetLogArrayIndex(args.LastIncludedIndex)
+		if ai >= 0 && ai < len(rf.Log) {
+			if rf.Log[ai].Term == args.LastIncludedTerm {
+				if ai+1 < len(rf.Log) {
+					newLog = append(newLog, rf.Log[ai+1:]...)
 				}
 			}
 		}
 	}
 
-	// 在保留的日志前插入哨兵条目，表示 LastIncludedIndex/Term
+	// 重建日志：哨兵 + suffix
 	rf.Log = make([]LogEntry, 0, 1+len(newLog))
 	rf.Log = append(rf.Log, LogEntry{Term: args.LastIncludedTerm})
-	if len(newLog) > 0 {
-		rf.Log = append(rf.Log, newLog...)
-	}
+	rf.Log = append(rf.Log, newLog...)
 
-	// 5. 更新快照元数据和持久化快照
+	// 更新快照元信息
 	rf.LastIncludedIndex = args.LastIncludedIndex
 	rf.LastIncludedTerm = args.LastIncludedTerm
 	rf.PersistedSnapshot = args.Snapshot
 
-	// 6. 持久化 Raft 状态与快照
+	// ⬆️ 必须同步 commitIndex / lastApplied，否则会 out-of-order apply
+	rf.CommitIndex = max(rf.CommitIndex, rf.LastIncludedIndex)
+	rf.LastApplied = max(rf.LastApplied, rf.LastIncludedIndex)
+
 	rf.persist()
 
-	// 7. 同步 CommitIndex 与 LastApplied 到快照点
-	// 快照包含了所有 <= LastIncludedIndex 的已提交日志
-	if rf.CommitIndex < args.LastIncludedIndex {
-		rf.CommitIndex = args.LastIncludedIndex
+	rf.mu.Unlock()
+
+	// 通知上层应用层安装 snapshot
+	applyMsg := raftapi.ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Snapshot,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
 	}
-	if rf.LastApplied < args.LastIncludedIndex {
-		rf.LastApplied = args.LastIncludedIndex
-	}
+	rf.applyCh <- applyMsg
 }
 
 // example code to send a RequestVote RPC to a server.
