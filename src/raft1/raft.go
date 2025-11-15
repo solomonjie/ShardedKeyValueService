@@ -155,6 +155,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int // 冲突条目的任期
+	XIndex  int // 冲突任期中第一个条目的索引 (即 Follower 希望 Leader 下次尝试的索引)
+	XLen    int // Follower 当前日志的长度 (当 PrevLogIndex 越界时使用)
 }
 
 func (rf *Raft) getRandomElectionTimeout() time.Duration {
@@ -263,7 +266,47 @@ func (rf *Raft) replicateLog(server int) {
 
 		} else {
 			// 失败处理 (Success=false)，意味着日志不匹配
-			rf.NextIndex[server]--
+			newNextIndex := rf.NextIndex[server]
+
+			if reply.XLen > 0 {
+				newNextIndex = reply.XLen
+			}
+
+			if reply.XTerm != 0 {
+				leaderLogIndex := len(rf.Log) - 1
+				lastIndexInLeaderLog := -1
+				for i := leaderLogIndex; i > 0; i-- {
+					if rf.Log[i].Term == reply.Term {
+						lastIndexInLeaderLog = i
+						break
+					}
+
+					if rf.Log[i].Term < reply.Term {
+						break
+					}
+				}
+
+				if lastIndexInLeaderLog != -1 {
+					// Case 4B: Leader 拥有 XTerm，从该任期匹配点之后开始发送
+					// NextIndex 设为 Leader 日志中 XTerm 最后一个条目的下一位
+					newNextIndex = lastIndexInLeaderLog + 1
+				} else {
+					// Case 4A: Leader 没有 XTerm，直接跳到 Follower 冲突任期之外的索引
+					// NextIndex 设为 Follower 建议的 XIndex
+					newNextIndex = reply.XIndex
+				}
+			}
+
+			if newNextIndex < 1 {
+				newNextIndex = 1
+			}
+
+			if newNextIndex < rf.NextIndex[server] {
+				rf.NextIndex[server] = newNextIndex
+			} else if rf.NextIndex[server] > 1 {
+				rf.NextIndex[server]--
+			}
+
 			// 立即再次尝试复制，以更快地收敛日志
 			go rf.replicateLog(server)
 		}
@@ -358,8 +401,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.CurrentTerm
 
 	lastLogIndex := len(rf.Log) - 1
-	if args.PrevLogIndex > lastLogIndex || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
+		reply.XLen = lastLogIndex + 1
+		return
+	}
+
+	if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.Log[args.PrevLogIndex].Term
+		xIndex := args.PrevLogIndex
+		for xIndex > 0 && rf.Log[xIndex-1].Term == reply.XTerm {
+			xIndex--
+		}
+		reply.XIndex = xIndex // 第一个冲突任期条目的索引
 		return
 	}
 
