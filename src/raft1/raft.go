@@ -7,13 +7,13 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -80,14 +80,13 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.Log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -95,19 +94,21 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		return
+	} else {
+		rf.CurrentTerm = currentTerm
+		rf.VotedFor = votedFor
+		rf.Log = log
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -154,6 +155,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int // 冲突条目的任期
+	XIndex  int // 冲突任期中第一个条目的索引 (即 Follower 希望 Leader 下次尝试的索引)
+	XLen    int // Follower 当前日志的长度 (当 PrevLogIndex 越界时使用)
 }
 
 func (rf *Raft) getRandomElectionTimeout() time.Duration {
@@ -166,6 +170,7 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.State = Follower
 	rf.CurrentTerm = term
 	rf.VotedFor = -1
+	rf.persist()
 	rf.ElectionTimer.Reset(rf.getRandomElectionTimeout())
 }
 
@@ -261,7 +266,47 @@ func (rf *Raft) replicateLog(server int) {
 
 		} else {
 			// 失败处理 (Success=false)，意味着日志不匹配
-			rf.NextIndex[server]--
+			newNextIndex := rf.NextIndex[server]
+
+			if reply.XLen > 0 {
+				newNextIndex = reply.XLen
+			}
+
+			if reply.XTerm != 0 {
+				leaderLogIndex := len(rf.Log) - 1
+				lastIndexInLeaderLog := -1
+				for i := leaderLogIndex; i > 0; i-- {
+					if rf.Log[i].Term == reply.Term {
+						lastIndexInLeaderLog = i
+						break
+					}
+
+					if rf.Log[i].Term < reply.Term {
+						break
+					}
+				}
+
+				if lastIndexInLeaderLog != -1 {
+					// Case 4B: Leader 拥有 XTerm，从该任期匹配点之后开始发送
+					// NextIndex 设为 Leader 日志中 XTerm 最后一个条目的下一位
+					newNextIndex = lastIndexInLeaderLog + 1
+				} else {
+					// Case 4A: Leader 没有 XTerm，直接跳到 Follower 冲突任期之外的索引
+					// NextIndex 设为 Follower 建议的 XIndex
+					newNextIndex = reply.XIndex
+				}
+			}
+
+			if newNextIndex < 1 {
+				newNextIndex = 1
+			}
+
+			if newNextIndex < rf.NextIndex[server] {
+				rf.NextIndex[server] = newNextIndex
+			} else if rf.NextIndex[server] > 1 {
+				rf.NextIndex[server]--
+			}
+
 			// 立即再次尝试复制，以更快地收敛日志
 			go rf.replicateLog(server)
 		}
@@ -293,6 +338,7 @@ func (rf *Raft) startElection() {
 	rf.State = Candidate
 	rf.CurrentTerm++
 	rf.VotedFor = rf.me // 给自己投票
+	rf.persist()
 
 	lastLogIndex := len(rf.Log) - 1
 	lastLogTerm := rf.Log[lastLogIndex].Term
@@ -355,8 +401,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.CurrentTerm
 
 	lastLogIndex := len(rf.Log) - 1
-	if args.PrevLogIndex > lastLogIndex || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
+		reply.XLen = lastLogIndex + 1
+		return
+	}
+
+	if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.Log[args.PrevLogIndex].Term
+		xIndex := args.PrevLogIndex
+		for xIndex > 0 && rf.Log[xIndex-1].Term == reply.XTerm {
+			xIndex--
+		}
+		reply.XIndex = xIndex // 第一个冲突任期条目的索引
 		return
 	}
 
@@ -433,6 +491,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if canVote && logOk {
 		rf.VotedFor = args.CandidateID
 		reply.VoteGranted = true
+		rf.persist()
 		rf.ElectionTimer.Reset(rf.getRandomElectionTimeout())
 	} else {
 		reply.VoteGranted = false
@@ -496,6 +555,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.CurrentTerm,
 	}
 	rf.Log = append(rf.Log, newEntry)
+	rf.persist()
 
 	newIndex := len(rf.Log) - 1
 
