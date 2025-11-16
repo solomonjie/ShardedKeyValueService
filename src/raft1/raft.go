@@ -168,7 +168,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.LastIncludedTerm = term
 	rf.PersistedSnapshot = snapshot
 
-	// ⬆️ 必须同步 commitIndex / lastApplied，否则会乱序 apply
+	// 必须同步 commitIndex / lastApplied，否则会乱序 apply
 	if rf.CommitIndex < index {
 		rf.CommitIndex = index
 	}
@@ -656,7 +656,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.LastIncludedTerm = args.LastIncludedTerm
 	rf.PersistedSnapshot = args.Snapshot
 
-	// ⬆️ 必须同步 commitIndex / lastApplied，否则会 out-of-order apply
+	// 必须同步 commitIndex / lastApplied，否则会 out-of-order apply
 	rf.CommitIndex = max(rf.CommitIndex, rf.LastIncludedIndex)
 	rf.LastApplied = max(rf.LastApplied, rf.LastIncludedIndex)
 
@@ -800,7 +800,7 @@ func (rf *Raft) applyDaemon() {
 				SnapshotIndex: rf.LastIncludedIndex,
 			}
 
-			// 【关键修正点 A】：必须在锁内更新 LastApplied。
+			// 必须在锁内更新 LastApplied。
 			// 否则，在下一次循环中，rf.LastApplied < rf.LastIncludedIndex 检查仍为 true，
 			// 导致无限次尝试发送快照消息，阻塞日志应用 (活锁)。
 			rf.LastApplied = rf.LastIncludedIndex
@@ -837,7 +837,7 @@ func (rf *Raft) applyDaemon() {
 				}
 			}
 
-			// 【关键修正点 B】：在锁内更新 LastApplied 到新的 CommitIndex
+			// 在锁内更新 LastApplied 到新的 CommitIndex
 			// 必须在发送前更新，以防止在发送过程中 Leader 更新了 CommitIndex，导致重复应用。
 			rf.LastApplied = lastIndexToApply
 
