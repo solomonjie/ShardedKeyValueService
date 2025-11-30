@@ -157,7 +157,7 @@ func (rsm *RSM) applier() {
 
 func (rsm *RSM) monitor() {
 	for {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 
 		term, isLeader := rsm.rf.GetState()
 
