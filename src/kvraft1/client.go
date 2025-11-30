@@ -3,6 +3,9 @@ package kvraft
 import (
 	// 引入 rand 和 time
 
+	"math/rand"
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
@@ -17,7 +20,10 @@ type Clerk struct {
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, servers: servers}
-	ck.leaderId = 0 // 初始化为0，后期修复
+
+	// 初始化为随机server， 减少高并发时对同一个server造成 消息阻塞，第二增大获取到server的速度
+	rand.NewSource(time.Now().UnixNano())
+	ck.leaderId = rand.Intn(len(ck.servers))
 	return ck
 }
 
@@ -47,15 +53,14 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			}
 
 			if reply.Err == rpc.ErrWrongLeader {
-				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+				ck.leaderId = (server + 1) % len(ck.servers)
 				continue
 			}
 		} else {
-			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			ck.leaderId = (server + 1) % len(ck.servers)
 		}
 
-		// 避免过快重试
-		// time.Sleep(10 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -96,13 +101,13 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 			}
 
 			if reply.Err == rpc.ErrWrongLeader {
-				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+				ck.leaderId = (server + 1) % len(ck.servers)
 				continue
 			}
 		} else {
-			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			ck.leaderId = (server + 1) % len(ck.servers)
 		}
 
-		// time.Sleep(10 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 }
