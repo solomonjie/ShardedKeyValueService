@@ -73,6 +73,12 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		sm:           sm,
 		notifyChs:    make(map[int]chan OpResult),
 	}
+
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+	}
+
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
@@ -110,19 +116,24 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.notifyChs[index] = ch
 	rsm.mu.Unlock()
 
-	res := <-ch
-
 	defer func() {
 		rsm.mu.Lock()
 		delete(rsm.notifyChs, index)
 		rsm.mu.Unlock()
 	}()
 
-	if res.OpId == op.Id {
-		return rpc.OK, res.Value
-	}
+	select {
+	case res := <-ch:
+		if res.OpId == op.Id {
+			return rpc.OK, res.Value
+		}
+		// OpId 不匹配或 monitor 信号 (-1)，返回 Leader 错误
+		return rpc.ErrWrongLeader, nil
 
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	case <-time.After(3 * time.Second):
+		// 超时意味着 Leadership 可能已经丢失
+		return rpc.ErrWrongLeader, nil
+	}
 }
 
 func (rsm *RSM) applier() {
@@ -150,7 +161,9 @@ func (rsm *RSM) applier() {
 			}
 
 		} else if msg.SnapshotValid {
+			rsm.mu.Lock()
 			rsm.sm.Restore(msg.Snapshot)
+			rsm.mu.Unlock()
 		}
 	}
 }
