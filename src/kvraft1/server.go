@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 
@@ -60,12 +61,46 @@ func (kv *KVServer) DoOp(req any) any {
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	return nil
+	// 1. 加锁：保护共享的数据库状态
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 2. 序列化数据库状态
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	// 编码 kv.db (map[string]KVStore)
+	if err := e.Encode(kv.db); err != nil {
+		// 在实际生产环境中，这里应该进行更详细的错误处理和日志记录
+		panic(err)
+	}
+
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
+	// 1. 检查快照数据：如果 data 为空，则无需恢复（或使用空状态）
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	// 2. 加锁：保护共享的数据库状态
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 3. 反序列化
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	// 注意：这里我们使用一个新的 map 来接收反序列化的数据，然后替换旧的 kv.db
+	var nextDb map[string]KVStore
+	if err := d.Decode(&nextDb); err != nil {
+		// 在实际生产环境中，这里应该进行更详细的错误处理和日志记录
+		panic(err)
+	}
+
+	// 4. 替换当前数据库状态
+	kv.db = nextDb
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
