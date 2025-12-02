@@ -1,3 +1,15 @@
+整体的工作流程
+1. 客户端请求,Clerk (客户端),调用 Get() 或 Put() RPC。,向 潜在的 Leader KVServer 发送请求。
+2. 请求转发,KVServer (Leader),在 Get() 或 Put() RPC 处理函数中，调用 kv.rsm.Submit(args)。,将客户端操作作为 Raft 日志条目提交给 RSM 层。
+3. 日志提交,RSM (Leader),Submit() 调用 raft.Start(Op)，并将操作包装在一个 Op 结构中（包含唯一标识符）。,开始 Raft 协议，尝试将该操作复制到多数派。
+4. Raft 复制,Raft (所有节点),Leader 发送 AppendEntries RPCs；多数派确认。,确保操作被持久化和复制。
+5. 提交应用,Raft (所有节点),操作被提交后，Raft 将 ApplyMsg 发送到 applyCh。,通知上层服务（RSM）该操作已安全提交。
+6. RSM 读取,RSM (所有节点),Reader Goroutine 从 applyCh 读取 ApplyMsg。,接收已提交的命令。
+7. 状态机执行,RSM (所有节点),调用 kv.DoOp(op) 方法。,在本地执行客户端操作，更新 kv.db。
+8. 结果返回,RSM (Leader),Reader Goroutine 将 DoOp() 的返回值发送回给在步骤 3 中等待的 Submit() goroutine。,将操作执行结果传递给等待的提交线程。
+9. RPC 响应,KVServer (Leader),Submit() 方法返回结果。 Get() 或 Put() RPC 处理函数将该结果打包成 RPC 响应。,返回最终结果给客户端 Clerk。
+10. 客户端接收,Clerk (客户端),接收 RPC 响应，完成请求。,客户端操作完成。
+
 任务一状态机的实现，下面几个点需要特别理清
 1. RSM 是单独的一层中间件
    位置：它夹在“上层应用程序”（如 KV Server）和“底层共识”（Raft）之间。
