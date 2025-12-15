@@ -1,17 +1,22 @@
 package shardgrp
 
 import (
+	"bytes"
+	"sync"
 	"sync/atomic"
-
 
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/shardkv1/shardgrp/shardrpc"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
+type KVStore struct {
+	Value   string
+	Version rpc.Tversion
+}
 
 type KVServer struct {
 	me   int
@@ -20,30 +25,106 @@ type KVServer struct {
 	gid  tester.Tgid
 
 	// Your code here
+	mu sync.Mutex
+	db map[string]KVStore
 }
-
 
 func (kv *KVServer) DoOp(req any) any {
-	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	switch op := req.(type) {
+	case rpc.GetArgs:
+		if item, ok := kv.db[op.Key]; ok {
+			return rpc.GetReply{Value: item.Value, Version: item.Version, Err: rpc.OK}
+		} else {
+			return rpc.GetReply{Err: rpc.ErrNoKey}
+		}
+	case rpc.PutArgs:
+		item, ok := kv.db[op.Key]
+
+		if ok && item.Version != op.Version {
+			return rpc.PutReply{Err: rpc.ErrVersion}
+		}
+
+		newVersion := op.Version + 1
+		kv.db[op.Key] = KVStore{
+			Value:   op.Value,
+			Version: newVersion,
+		}
+		return rpc.PutReply{Err: rpc.OK}
+	default:
+		return nil
+	}
 }
 
-
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	if err := e.Encode(kv.db); err != nil {
+		panic(err)
+	}
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var nextDb map[string]KVStore
+
+	if err := d.Decode(&nextDb); err != nil {
+		panic(err)
+	}
+
+	kv.db = nextDb
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
-	// Your code here
+	err, res := kv.rsm.Submit(*args)
+
+	if err == rpc.ErrWrongLeader {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+
+	rep, ok := res.(rpc.GetReply)
+
+	if !ok {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+
+	*reply = rep
 }
 
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
-	// Your code here
+	err, res := kv.rsm.Submit(*args)
+
+	if err == rpc.ErrWrongLeader {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+
+	// 从 any 类型转换为 rpc.PutReply
+	rep, ok := res.(rpc.PutReply)
+	if !ok {
+		reply.Err = rpc.ErrWrongLeader // 通知客户端重试找 Leader
+		return
+	}
+
+	*reply = rep
 }
 
 // Freeze the specified shard (i.e., reject future Get/Puts for this
@@ -93,8 +174,13 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	labgob.Register(shardrpc.InstallShardArgs{})
 	labgob.Register(shardrpc.DeleteShardArgs{})
 	labgob.Register(rsm.Op{})
+	labgob.Register(KVStore{})
 
-	kv := &KVServer{gid: gid, me: me}
+	kv := &KVServer{
+		gid: gid,
+		me:  me,
+		db:  make(map[string]KVStore),
+	}
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 
 	// Your code here
