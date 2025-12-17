@@ -9,6 +9,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
+	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
 	tester "6.5840/tester1"
 )
@@ -18,6 +19,20 @@ type KVStore struct {
 	Version rpc.Tversion
 }
 
+type ShardState int
+
+const (
+	ShardOwned   ShardState = iota // 0: Shard 归属当前 Group，正常读写
+	ShardFrozen                    // 1. Shard 归属当前 Group，但已冻结，只读，准备迁出 (只接受 Get)
+	ShardDeleted                   // 2: Shard 数据已删除 (不接受 Get/Put)
+)
+
+type ShardKVStore struct {
+	ShardID    shardcfg.Tshid
+	ShardState ShardState
+	ShardDB    map[string]KVStore
+}
+
 type KVServer struct {
 	me   int
 	dead int32 // set by Kill()
@@ -25,8 +40,9 @@ type KVServer struct {
 	gid  tester.Tgid
 
 	// Your code here
-	mu sync.Mutex
-	db map[string]KVStore
+	mu           sync.Mutex
+	configNum    shardcfg.Tnum
+	ShardStorage map[shardcfg.Tshid]ShardKVStore
 }
 
 func (kv *KVServer) DoOp(req any) any {
@@ -35,20 +51,37 @@ func (kv *KVServer) DoOp(req any) any {
 
 	switch op := req.(type) {
 	case rpc.GetArgs:
-		if item, ok := kv.db[op.Key]; ok {
+		shardId := shardcfg.Key2Shard(op.Key)
+
+		shardStorage, ok := kv.ShardStorage[shardId]
+		if !ok || shardStorage.ShardState == ShardDeleted {
+			return rpc.GetReply{Err: rpc.ErrWrongGroup}
+		}
+
+		if item, ok := shardStorage.ShardDB[op.Key]; ok {
 			return rpc.GetReply{Value: item.Value, Version: item.Version, Err: rpc.OK}
 		} else {
 			return rpc.GetReply{Err: rpc.ErrNoKey}
 		}
 	case rpc.PutArgs:
-		item, ok := kv.db[op.Key]
+		shardId := shardcfg.Key2Shard(op.Key)
+
+		shardStorage, ok := kv.ShardStorage[shardId]
+		if !ok || shardStorage.ShardState == ShardDeleted {
+			//return rpc.PutReply{Err: rpc.ErrWrongGroup}
+			// This version will build shardID
+			kv.BuildShard(shardId)
+		}
+		shardStorage = kv.ShardStorage[shardId]
+
+		item, ok := shardStorage.ShardDB[op.Key]
 
 		if ok && item.Version != op.Version {
 			return rpc.PutReply{Err: rpc.ErrVersion}
 		}
 
 		newVersion := op.Version + 1
-		kv.db[op.Key] = KVStore{
+		shardStorage.ShardDB[op.Key] = KVStore{
 			Value:   op.Value,
 			Version: newVersion,
 		}
@@ -58,6 +91,22 @@ func (kv *KVServer) DoOp(req any) any {
 	}
 }
 
+func (kv *KVServer) BuildShard(shardID shardcfg.Tshid) {
+	_, ok := kv.ShardStorage[shardID]
+
+	if ok {
+		return
+	}
+
+	shardStorage := ShardKVStore{
+		ShardID:    shardID,
+		ShardState: ShardOwned,
+		ShardDB:    make(map[string]KVStore),
+	}
+
+	kv.ShardStorage[shardID] = shardStorage
+}
+
 func (kv *KVServer) Snapshot() []byte {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -65,7 +114,11 @@ func (kv *KVServer) Snapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
-	if err := e.Encode(kv.db); err != nil {
+	if err := e.Encode(kv.configNum); err != nil {
+		panic(err)
+	}
+
+	if err := e.Encode(kv.ShardStorage); err != nil {
 		panic(err)
 	}
 	return w.Bytes()
@@ -82,13 +135,18 @@ func (kv *KVServer) Restore(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
-	var nextDb map[string]KVStore
+	var nextConfigNum shardcfg.Tnum
+	var nextDb map[shardcfg.Tshid]ShardKVStore
 
+	if err := d.Decode(&nextConfigNum); err != nil {
+		panic(err)
+	}
 	if err := d.Decode(&nextDb); err != nil {
 		panic(err)
 	}
 
-	kv.db = nextDb
+	kv.configNum = nextConfigNum
+	kv.ShardStorage = nextDb
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -175,15 +233,15 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	labgob.Register(shardrpc.DeleteShardArgs{})
 	labgob.Register(rsm.Op{})
 	labgob.Register(KVStore{})
+	labgob.Register(ShardKVStore{})
 
 	kv := &KVServer{
-		gid: gid,
-		me:  me,
-		db:  make(map[string]KVStore),
+		gid:          gid,
+		me:           me,
+		configNum:    0,
+		ShardStorage: make(map[shardcfg.Tshid]ShardKVStore),
 	}
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
-
-	// Your code here
 
 	return []tester.IService{kv, kv.rsm.Raft()}
 }
