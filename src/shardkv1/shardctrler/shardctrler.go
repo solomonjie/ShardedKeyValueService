@@ -209,7 +209,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 
 		if err != rpc.OK {
 			// Put 失败 (ErrVersion 或网络错误)，返回循环开头重新 Query
-			log.Printf("ShardCtrler: Failed to publish config %d (version %d), retrying: %v", new.Num, current.Num, err)
+			// log.Printf("ShardCtrler: Failed to publish config %d (version %d), retrying: %v", new.Num, current.Num, err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
