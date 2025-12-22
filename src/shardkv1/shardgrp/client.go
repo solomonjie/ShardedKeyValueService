@@ -26,13 +26,18 @@ func MakeClerk(clnt *tester.Clnt, servers []string) *Clerk {
 
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := rpc.GetArgs{Key: key}
+	loopCount := 0
 
 	for {
+		if loopCount > len(ck.servers)*3 {
+			return "", 0, rpc.ErrWrongGroup
+		}
+		loopCount++
 		reply := rpc.GetReply{}
 		server := ck.leaderId
 
 		ok := ck.clnt.Call(ck.servers[server], "KVServer.Get", &args, &reply)
-		//log.Printf("Submit Request %T %v Reply: %v", args, args, reply)
+
 		if ok {
 			if reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey {
 				return reply.Value, reply.Version, reply.Err
@@ -47,6 +52,8 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			if reply.Err == rpc.ErrWrongGroup {
 				return "", 0, reply.Err
 			}
+
+			ck.leaderId = (server + 1) % len(ck.servers)
 		} else {
 			ck.leaderId = (server + 1) % len(ck.servers)
 		}
@@ -58,7 +65,12 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	isFirstTry := true
+	loopCount := 0
 	for {
+		if loopCount > len(ck.servers)*3 {
+			return rpc.ErrWrongGroup
+		}
+		loopCount++
 		reply := rpc.GetReply{}
 		server := ck.leaderId
 
